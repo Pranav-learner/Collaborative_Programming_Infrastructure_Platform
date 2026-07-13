@@ -334,3 +334,9 @@ Coverage by level:
 - **gateway** — real end-to-end handshakes with a gorilla client: upgrade+echo,
   auth rejection (401), origin rejection/acceptance (403/101), capacity
   rejection (503), graceful shutdown closing the client, and health endpoints.
+
+
+### Extras 
+
+![alt text](image.png)
+![alt text](image-1.png)
