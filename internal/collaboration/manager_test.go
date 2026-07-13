@@ -2,6 +2,7 @@ package collaboration
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -10,7 +11,11 @@ import (
 	"cpip/internal/collaboration/events"
 	"cpip/internal/collaboration/storage"
 	"cpip/internal/collaboration/types"
+	"cpip/internal/collaboration/yjs"
 )
+
+// yjsNew builds a standalone peer document for tests that simulate a remote client.
+func yjsNew() *yjs.DocWrapper { return yjs.New(yjs.Options{GC: true}) }
 
 func TestGetOrCreateDocument(t *testing.T) {
 	repo := storage.NewInMemoryRepository()
@@ -199,6 +204,7 @@ func TestBackgroundWorkers(t *testing.T) {
 		SnapshotInterval:       30 * time.Millisecond,
 		SnapshotEditsThreshold: 1,
 		BackgroundSaveInterval: 10 * time.Millisecond,
+		GCInterval:             10 * time.Millisecond,
 		IdleTimeout:            120 * time.Millisecond,
 		MaxDocumentSize:        10 * 1024 * 1024,
 		MaxPendingUpdatesLimit: 1000,
@@ -295,13 +301,13 @@ func TestConcurrentEdits(t *testing.T) {
 			for j := 0; j < editsPerWorker; j++ {
 				// Thread-safe mutations
 				doc.InsertText(0, "A")
-				
+
 				// Generate local updates
 				up := doc.EncodeStateAsUpdate(nil)
-				
+
 				// Apply incremental update (concurrency-safe)
 				_ = mgr.ApplyIncrementalUpdate(ctx, docID, up)
-				
+
 				time.Sleep(1 * time.Millisecond)
 			}
 		}(i)
@@ -313,5 +319,171 @@ func TestConcurrentEdits(t *testing.T) {
 	expectedLength := workers * editsPerWorker
 	if len(doc.GetText()) != expectedLength {
 		t.Errorf("expected text length to be %d, got %d", expectedLength, len(doc.GetText()))
+	}
+}
+
+func TestParticipantLifecycle(t *testing.T) {
+	mgr := NewManager(Params{Config: config.Default(), Repo: storage.NewInMemoryRepository()})
+	ctx := context.Background()
+
+	if _, err := mgr.GetOrCreateDocument(ctx, "doc", "room", "f.go"); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	ch := mgr.Events().Subscribe(16)
+	defer mgr.Events().Unsubscribe(ch)
+
+	if err := mgr.JoinDocument(ctx, "doc", "alice"); err != nil {
+		t.Fatalf("join alice: %v", err)
+	}
+	if err := mgr.JoinDocument(ctx, "doc", "bob"); err != nil {
+		t.Fatalf("join bob: %v", err)
+	}
+	if got := len(mgr.Participants("doc")); got != 2 {
+		t.Fatalf("participants = %d, want 2", got)
+	}
+
+	mgr.MarkParticipantSynced("doc", "alice")
+	synced := false
+	for _, p := range mgr.Participants("doc") {
+		if p.ID == "alice" && p.SyncStatus == types.SyncSynced {
+			synced = true
+		}
+	}
+	if !synced {
+		t.Fatal("alice not marked synced")
+	}
+
+	if err := mgr.LeaveDocument(ctx, "doc", "alice"); err != nil {
+		t.Fatalf("leave: %v", err)
+	}
+	if got := len(mgr.Participants("doc")); got != 1 {
+		t.Fatalf("participants after leave = %d, want 1", got)
+	}
+
+	// Joining an unknown document is an error.
+	if err := mgr.JoinDocument(ctx, "missing", "x"); err != types.ErrDocumentNotFound {
+		t.Fatalf("join missing err = %v, want ErrDocumentNotFound", err)
+	}
+}
+
+func TestLateJoinAndBatch(t *testing.T) {
+	mgr := NewManager(Params{Config: config.Default(), Repo: storage.NewInMemoryRepository()})
+	ctx := context.Background()
+
+	doc, err := mgr.GetOrCreateDocument(ctx, "doc", "room", "f.go")
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	doc.InsertText(0, "seed content")
+
+	// A late joiner requests full state.
+	full, err := mgr.InitialSync(ctx, "doc")
+	if err != nil {
+		t.Fatalf("initial sync: %v", err)
+	}
+	joiner := yjsNew()
+	if err := joiner.ApplyUpdate(full); err != nil {
+		t.Fatalf("apply full: %v", err)
+	}
+	if joiner.GetText() != "seed content" {
+		t.Fatalf("late-join text = %q", joiner.GetText())
+	}
+
+	// Batched updates from another editor.
+	editor := yjsNew()
+	if err := editor.ApplyUpdate(full); err != nil {
+		t.Fatalf("editor seed: %v", err)
+	}
+	var updates [][]byte
+	editor.SetUpdateHandler(func(u []byte, _ any) {
+		cp := make([]byte, len(u))
+		copy(cp, u)
+		updates = append(updates, cp)
+	})
+	editor.InsertText(12, " A")
+	editor.InsertText(14, " B")
+
+	if err := mgr.BatchUpdates(ctx, "doc", updates); err != nil {
+		t.Fatalf("batch: %v", err)
+	}
+	if got := doc.GetText(); got != "seed content A B" {
+		t.Fatalf("after batch = %q, want %q", got, "seed content A B")
+	}
+
+	stats, err := mgr.Statistics("doc")
+	if err != nil {
+		t.Fatalf("stats: %v", err)
+	}
+	if stats.Version == 0 {
+		t.Fatal("expected non-zero version after edits")
+	}
+}
+
+func TestUpdateSizeEnforcement(t *testing.T) {
+	cfg := config.Default()
+	cfg.MaxUpdateSize = 8
+	mgr := NewManager(Params{Config: cfg, Repo: storage.NewInMemoryRepository()})
+	ctx := context.Background()
+	if _, err := mgr.GetOrCreateDocument(ctx, "doc", "room", "f.go"); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	if err := mgr.ApplyIncrementalUpdate(ctx, "doc", nil); err != types.ErrMalformedUpdate {
+		t.Fatalf("empty err = %v, want ErrMalformedUpdate", err)
+	}
+	oversize := make([]byte, 64)
+	if err := mgr.ApplyIncrementalUpdate(ctx, "doc", oversize); err != types.ErrUpdateSizeExceeded {
+		t.Fatalf("oversize err = %v, want ErrUpdateSizeExceeded", err)
+	}
+}
+
+func TestHighConcurrencyManyDocuments(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping stress test in -short mode")
+	}
+	mgr := NewManager(Params{Config: config.Default(), Repo: storage.NewInMemoryRepository()})
+	mgr.Start()
+	defer mgr.Stop()
+
+	ctx := context.Background()
+	const docs = 40
+	const participantsPerDoc = 8
+
+	var wg sync.WaitGroup
+	for d := 0; d < docs; d++ {
+		wg.Add(1)
+		go func(d int) {
+			defer wg.Done()
+			docID := fmt.Sprintf("doc-%d", d)
+			doc, err := mgr.GetOrCreateDocument(ctx, docID, "room", "f.go")
+			if err != nil {
+				t.Errorf("create %s: %v", docID, err)
+				return
+			}
+			var inner sync.WaitGroup
+			for p := 0; p < participantsPerDoc; p++ {
+				inner.Add(1)
+				go func(p int) {
+					defer inner.Done()
+					pid := fmt.Sprintf("p-%d", p)
+					_ = mgr.JoinDocument(ctx, docID, pid)
+					doc.InsertText(0, "x")
+					_ = mgr.ApplyIncrementalUpdate(ctx, docID, doc.EncodeStateAsUpdate(nil))
+					_, _ = mgr.HandleSyncStep1(ctx, docID, doc.EncodeStateVector())
+					mgr.MarkParticipantSynced(docID, pid)
+					_ = mgr.LeaveDocument(ctx, docID, pid)
+				}(p)
+			}
+			inner.Wait()
+			if err := mgr.SaveSnapshot(ctx, docID); err != nil {
+				t.Errorf("snapshot %s: %v", docID, err)
+			}
+		}(d)
+	}
+	wg.Wait()
+
+	if got := mgr.Registry().Count(); got != docs {
+		t.Fatalf("registry count = %d, want %d", got, docs)
 	}
 }
