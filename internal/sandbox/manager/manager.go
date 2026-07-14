@@ -21,6 +21,13 @@ import (
 	"cpip/internal/sandbox/recovery"
 	"cpip/internal/sandbox/registry"
 	"cpip/internal/sandbox/runtime"
+	runtimeController "cpip/internal/sandbox/runtime/controller"
+	runtimeFeatures "cpip/internal/sandbox/runtime/features"
+	runtimeHealth "cpip/internal/sandbox/runtime/health"
+	runtimePool "cpip/internal/sandbox/runtime/pool"
+	runtimeRegistry "cpip/internal/sandbox/runtime/registry"
+	runtimeSelection "cpip/internal/sandbox/runtime/selection"
+	runtimeVersion "cpip/internal/sandbox/runtime/version"
 	"cpip/internal/sandbox/scheduler"
 	"cpip/internal/sandbox/security/audit"
 	"cpip/internal/sandbox/security/engine"
@@ -39,6 +46,7 @@ import (
 type SandboxManager struct {
 	cfg            config.Config
 	adapter        runtime.RuntimeAdapter
+	runtimeCtrl    *runtimeController.RuntimeController
 	reg            *registry.SandboxRegistry
 	bus            *events.Bus
 	recorder       metrics.Recorder
@@ -73,13 +81,69 @@ func NewSandboxManager(cfg config.Config, adapter runtime.RuntimeAdapter, rec me
 	bus := events.NewBus()
 	reg := registry.NewSandboxRegistry()
 
+	// Initialize runtime abstraction components
+	regRt := runtimeRegistry.NewRuntimeRegistry()
+
+	_ = regRt.Register(runtime.RuntimeDescriptor{
+		RuntimeID:      "docker",
+		DisplayName:    "Docker Engine",
+		Vendor:         "Docker Inc",
+		Version:        "24.0.0",
+		Status:         runtimeVersion.StatusSupported,
+		Priority:       10,
+		DefaultRuntime: true,
+		Capabilities: map[runtimeFeatures.Feature]bool{
+			runtimeFeatures.SupportsNetworking:           true,
+			runtimeFeatures.SupportsTTY:                  true,
+			runtimeFeatures.SupportsVolumes:              true,
+			runtimeFeatures.SupportsReadOnlyRootFS:       true,
+			runtimeFeatures.SupportsInteractiveExecution: true,
+			runtimeFeatures.SupportsCustomImages:         true,
+		},
+	})
+
+	_ = regRt.Register(runtime.RuntimeDescriptor{
+		RuntimeID:      "gvisor",
+		DisplayName:    "gVisor Isolation (runsc)",
+		Vendor:         "Google",
+		Version:        "1.0.0",
+		Status:         runtimeVersion.StatusSupported,
+		Priority:       20,
+		Capabilities: map[runtimeFeatures.Feature]bool{
+			runtimeFeatures.SupportsNetworking:           true,
+			runtimeFeatures.SupportsTTY:                  true,
+			runtimeFeatures.SupportsVolumes:              true,
+			runtimeFeatures.SupportsReadOnlyRootFS:       true,
+			runtimeFeatures.SupportsInteractiveExecution: true,
+			runtimeFeatures.SupportsCustomImages:         true,
+		},
+	})
+
+	pRt := runtimePool.NewRuntimePool()
+	pRt.AddInstance("docker", "docker-1", adapter)
+	pRt.AddInstance("gvisor", "gvisor-1", adapter)
+
+	hmRt := runtimeHealth.NewRuntimeHealthManager(bus)
+	hmRt.RecordHeartbeat("docker", 5*time.Millisecond)
+	hmRt.RecordHeartbeat("gvisor", 8*time.Millisecond)
+
+	policyRt := runtimeSelection.SelectionPolicy{
+		DefaultRuntime: "docker",
+		Rules: map[string]string{
+			"HighSecurity": "gvisor",
+		},
+	}
+	seRt := runtimeSelection.NewSelectionEngine(regRt, policyRt)
+
+	ctrl := runtimeController.NewRuntimeController(regRt, pRt, hmRt, seRt, bus)
+
 	polReg := policies.NewMemRegistry()
 	polVal := policies.NewPolicyValidator(policies.DefaultBounds)
 	resv := resolver.NewPolicyResolver(polReg, polVal)
 	resEng := engine.NewResourcePolicyEngine()
 	secEng := engine.NewSecurityPolicyEngine()
 	audLog := audit.NewAuditLogger(bus, nil)
-	mon := monitor.NewResourceMonitor(reg, adapter, bus, rec, 100*time.Millisecond)
+	mon := monitor.NewResourceMonitor(reg, ctrl, bus, rec, 100*time.Millisecond)
 
 	lc := lifecycle.NewLifecycleManager(bus, rec)
 
@@ -91,12 +155,12 @@ func NewSandboxManager(cfg config.Config, adapter runtime.RuntimeAdapter, rec me
 	}
 	sched := scheduler.NewSandboxScheduler(reg, schedCfg)
 
-	hm := health.NewHealthMonitor(bus, adapter)
-	rw := watcher.NewResourceWatcher(bus, adapter, watcher.DefaultThresholds)
-	tc := timeout.NewTimeoutController(bus, adapter, lc, 5*time.Minute, 1*time.Minute)
+	hm := health.NewHealthMonitor(bus, ctrl)
+	rw := watcher.NewResourceWatcher(bus, ctrl, watcher.DefaultThresholds)
+	tc := timeout.NewTimeoutController(bus, ctrl, lc, 5*time.Minute, 1*time.Minute)
 	cm := cleanup.NewCleanupManager(cfg, reg)
-	cm.SetAdapterAndBus(adapter, bus)
-	rm := recovery.NewRecoveryManager(bus, adapter)
+	cm.SetAdapterAndBus(ctrl, bus)
+	rm := recovery.NewRecoveryManager(bus, ctrl)
 	sc := statistics.NewStatisticsCollector(bus)
 
 	coord := coordinator.NewLifecycleCoordinator(
@@ -105,12 +169,13 @@ func NewSandboxManager(cfg config.Config, adapter runtime.RuntimeAdapter, rec me
 
 	mgr := &SandboxManager{
 		cfg:            cfg,
-		adapter:        adapter,
+		adapter:        ctrl,
+		runtimeCtrl:    ctrl,
 		reg:            reg,
 		bus:            bus,
 		recorder:       rec,
 		lifecycle:      lc,
-		images:         images.NewImageManager(cfg, adapter, bus),
+		images:         images.NewImageManager(cfg, ctrl, bus),
 		workspace:      workspace.NewWorkspaceManager(cfg),
 		filesystem:     filesystem.NewFilesystemManager(),
 		network:        network.NewNetworkManager(cfg, rec),
@@ -516,3 +581,8 @@ func generateID() string {
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
 }
+
+func (sm *SandboxManager) GetRuntimeController() *runtimeController.RuntimeController {
+	return sm.runtimeCtrl
+}
+
