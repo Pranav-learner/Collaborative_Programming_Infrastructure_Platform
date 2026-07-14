@@ -15,6 +15,12 @@ const (
 	StateContainerCreated State = "container_created"
 	StateReady            State = "ready"
 	StateExecuting        State = "executing"
+	StateRunning          State = "running"
+	StateCompleted        State = "completed"
+	StateFailed           State = "failed"
+	StateRecovering       State = "recovering"
+	StateTimedOut         State = "timed_out"
+	StateTerminating      State = "terminating"
 	StateCleaning         State = "cleaning"
 	StateDestroyed        State = "destroyed"
 )
@@ -114,6 +120,12 @@ func (s *SandboxSession) GetExpiresAt() time.Time {
 	return s.ExpiresAt
 }
 
+func (s *SandboxSession) SetExpiresAt(t time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ExpiresAt = t
+}
+
 func (s *SandboxSession) GetStatus() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -182,6 +194,9 @@ func (s *SandboxSession) RUnlock() {
 type Stats struct {
 	CPUPercentage    float64 `json:"cpu_percentage"`
 	MemoryUsageBytes int64   `json:"memory_usage_bytes"`
+	DiskUsageBytes   int64   `json:"disk_usage_bytes"`
+	OutputSizeBytes  int64   `json:"output_size_bytes"`
+	ProcessCount     int64   `json:"process_count"`
 }
 
 // ValidateTransition returns nil if a state transition is legal, or an error if illegal.
@@ -195,13 +210,25 @@ func ValidateTransition(current, next State) error {
 	case StateCreated:
 		allowed = (next == StatePreparing || next == StateCleaning || next == StateDestroyed)
 	case StatePreparing:
-		allowed = (next == StateContainerCreated || next == StateCleaning || next == StateDestroyed)
+		allowed = (next == StateContainerCreated || next == StateReady || next == StateCleaning || next == StateDestroyed)
 	case StateContainerCreated:
 		allowed = (next == StateReady || next == StateCleaning || next == StateDestroyed)
 	case StateReady:
-		allowed = (next == StateExecuting || next == StateCleaning || next == StateDestroyed)
+		allowed = (next == StateExecuting || next == StateRunning || next == StateCleaning || next == StateDestroyed)
 	case StateExecuting:
-		allowed = (next == StateReady || next == StateCleaning || next == StateDestroyed)
+		allowed = (next == StateReady || next == StateRunning || next == StateCompleted || next == StateFailed || next == StateTimedOut || next == StateCleaning || next == StateDestroyed)
+	case StateRunning:
+		allowed = (next == StateCompleted || next == StateFailed || next == StateTimedOut || next == StateCleaning || next == StateDestroyed || next == StateReady)
+	case StateCompleted:
+		allowed = (next == StateCleaning || next == StateDestroyed)
+	case StateFailed:
+		allowed = (next == StateRecovering || next == StateCleaning || next == StateDestroyed)
+	case StateRecovering:
+		allowed = (next == StateRunning || next == StateExecuting || next == StateFailed || next == StateCleaning || next == StateDestroyed)
+	case StateTimedOut:
+		allowed = (next == StateTerminating || next == StateCleaning || next == StateDestroyed)
+	case StateTerminating:
+		allowed = (next == StateCleaning || next == StateDestroyed)
 	case StateCleaning:
 		allowed = (next == StateDestroyed)
 	case StateDestroyed:

@@ -1,7 +1,10 @@
 package events
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -31,21 +34,41 @@ const (
 	NetworkPrepared        Type = "network_prepared"
 	AuditRecorded          Type = "audit_recorded"
 	ResourceViolation      Type = "resource_violation"
+
+	// Stage 3 Module 3 Lifecycle/Monitoring events
+	SandboxStarted            Type = "sandbox_started"
+	SandboxRunning            Type = "sandbox_running"
+	SandboxHealthy            Type = "sandbox_healthy"
+	SandboxUnhealthy          Type = "sandbox_unhealthy"
+	ExecutionCompleted        Type = "execution_completed"
+	ExecutionFailed           Type = "execution_failed"
+	ExecutionTimedOut         Type = "execution_timed_out"
+	CleanupCompleted          Type = "cleanup_completed"
+	SandboxRecovered          Type = "sandbox_recovered"
+	ResourceThresholdExceeded Type = "resource_threshold_exceeded"
 )
 
 // Event describes a structured sandbox lifecycle event.
 type Event struct {
-	Type      Type      `json:"type"`
-	SandboxID string    `json:"sandbox_id"`
-	JobID     string    `json:"job_id,omitempty"`
-	Timestamp time.Time `json:"timestamp"`
-	Payload   any       `json:"payload,omitempty"`
+	EventID        string        `json:"event_id"`
+	CorrelationID  string        `json:"correlation_id"`
+	SequenceNumber int64         `json:"sequence_number"`
+	Type           Type          `json:"type"`
+	SandboxID      string        `json:"sandbox_id"`
+	JobID          string        `json:"job_id,omitempty"`
+	LifecycleState string        `json:"lifecycle_state,omitempty"`
+	Severity       string        `json:"severity,omitempty"` // "Info", "Warning", "Critical"
+	Duration       time.Duration `json:"duration,omitempty"`
+	Origin         string        `json:"origin,omitempty"`
+	Timestamp      time.Time     `json:"timestamp"`
+	Payload        any           `json:"payload,omitempty"`
 }
 
 // Bus is a thread-safe local event bus for sandbox instances.
 type Bus struct {
 	mu          sync.RWMutex
 	subscribers map[chan Event]struct{}
+	seqCounter  int64
 }
 
 // NewBus initializes a new sandbox event bus.
@@ -81,6 +104,13 @@ func (b *Bus) Publish(e Event) {
 	if e.Timestamp.IsZero() {
 		e.Timestamp = time.Now()
 	}
+	if e.EventID == "" {
+		e.EventID = generateEventID()
+	}
+	if e.SequenceNumber == 0 {
+		e.SequenceNumber = atomic.AddInt64(&b.seqCounter, 1)
+	}
+
 	for ch := range b.subscribers {
 		select {
 		case ch <- e:
@@ -88,4 +118,10 @@ func (b *Bus) Publish(e Event) {
 			// Non-blocking write to avoid hanging if subscriber buffer is full
 		}
 	}
+}
+
+func generateEventID() string {
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
 }

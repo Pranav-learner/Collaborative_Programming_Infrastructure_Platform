@@ -8,45 +8,61 @@ import (
 	"io"
 	"time"
 
+	"cpip/internal/sandbox/cleanup"
 	"cpip/internal/sandbox/config"
+	"cpip/internal/sandbox/coordinator"
 	"cpip/internal/sandbox/events"
 	"cpip/internal/sandbox/filesystem"
+	"cpip/internal/sandbox/health"
 	"cpip/internal/sandbox/images"
 	"cpip/internal/sandbox/lifecycle"
 	"cpip/internal/sandbox/metrics"
 	"cpip/internal/sandbox/network"
+	"cpip/internal/sandbox/recovery"
 	"cpip/internal/sandbox/registry"
 	"cpip/internal/sandbox/runtime"
+	"cpip/internal/sandbox/scheduler"
 	"cpip/internal/sandbox/security/audit"
 	"cpip/internal/sandbox/security/engine"
 	"cpip/internal/sandbox/security/monitor"
 	"cpip/internal/sandbox/security/policies"
 	"cpip/internal/sandbox/security/resolver"
+	"cpip/internal/sandbox/statistics"
+	"cpip/internal/sandbox/timeout"
 	"cpip/internal/sandbox/types"
 	"cpip/internal/sandbox/volumes"
+	"cpip/internal/sandbox/watcher"
 	"cpip/internal/sandbox/workspace"
 )
 
 // SandboxManager orchestrates the lifecycle, workspaces, filesystem operations, and container runtimes.
 type SandboxManager struct {
-	cfg         config.Config
-	adapter     runtime.RuntimeAdapter
-	reg         *registry.SandboxRegistry
-	bus         *events.Bus
-	recorder    metrics.Recorder
-	lifecycle   *lifecycle.LifecycleManager
-	images      *images.ImageManager
-	workspace   *workspace.WorkspaceManager
-	filesystem  *filesystem.FilesystemManager
-	network     *network.NetworkManager
-	volumes     *volumes.VolumeManager
-	policyReg   policies.Registry
-	policyVal   policies.Validator
-	resolver    *resolver.PolicyResolver
-	resEngine   *engine.ResourcePolicyEngine
-	secEngine   *engine.SecurityPolicyEngine
-	monitor     *monitor.ResourceMonitor
-	auditLogger *audit.AuditLogger
+	cfg            config.Config
+	adapter        runtime.RuntimeAdapter
+	reg            *registry.SandboxRegistry
+	bus            *events.Bus
+	recorder       metrics.Recorder
+	lifecycle      *lifecycle.LifecycleManager
+	images         *images.ImageManager
+	workspace      *workspace.WorkspaceManager
+	filesystem     *filesystem.FilesystemManager
+	network        *network.NetworkManager
+	volumes        *volumes.VolumeManager
+	policyReg      policies.Registry
+	policyVal      policies.Validator
+	resolver       *resolver.PolicyResolver
+	resEngine      *engine.ResourcePolicyEngine
+	secEngine      *engine.SecurityPolicyEngine
+	monitor        *monitor.ResourceMonitor
+	auditLogger    *audit.AuditLogger
+	cleanupManager *cleanup.CleanupManager
+	scheduler      *scheduler.SandboxScheduler
+	health         *health.HealthMonitor
+	watcher        *watcher.ResourceWatcher
+	timeout        *timeout.TimeoutController
+	recovery       *recovery.RecoveryManager
+	stats          *statistics.StatisticsCollector
+	coordinator    *coordinator.LifecycleCoordinator
 }
 
 // NewSandboxManager initializes a SandboxManager composition root.
@@ -65,26 +81,60 @@ func NewSandboxManager(cfg config.Config, adapter runtime.RuntimeAdapter, rec me
 	audLog := audit.NewAuditLogger(bus, nil)
 	mon := monitor.NewResourceMonitor(reg, adapter, bus, rec, 100*time.Millisecond)
 
-	mgr := &SandboxManager{
-		cfg:         cfg,
-		adapter:     adapter,
-		reg:         reg,
-		bus:         bus,
-		recorder:    rec,
-		lifecycle:   lifecycle.NewLifecycleManager(bus, rec),
-		images:      images.NewImageManager(cfg, adapter, bus),
-		workspace:   workspace.NewWorkspaceManager(cfg),
-		filesystem:  filesystem.NewFilesystemManager(),
-		network:     network.NewNetworkManager(cfg, rec),
-		volumes:     volumes.NewVolumeManager(cfg, rec),
-		policyReg:   polReg,
-		policyVal:   polVal,
-		resolver:    resv,
-		resEngine:   resEng,
-		secEngine:   secEng,
-		monitor:     mon,
-		auditLogger: audLog,
+	lc := lifecycle.NewLifecycleManager(bus, rec)
+
+	schedCfg := scheduler.IntervalConfig{
+		WatchInterval:   50 * time.Millisecond,
+		HealthInterval:  100 * time.Millisecond,
+		CleanupInterval: 200 * time.Millisecond,
+		TimeoutInterval: 100 * time.Millisecond,
 	}
+	sched := scheduler.NewSandboxScheduler(reg, schedCfg)
+
+	hm := health.NewHealthMonitor(bus, adapter)
+	rw := watcher.NewResourceWatcher(bus, adapter, watcher.DefaultThresholds)
+	tc := timeout.NewTimeoutController(bus, adapter, lc, 5*time.Minute, 1*time.Minute)
+	cm := cleanup.NewCleanupManager(cfg, reg)
+	cm.SetAdapterAndBus(adapter, bus)
+	rm := recovery.NewRecoveryManager(bus, adapter)
+	sc := statistics.NewStatisticsCollector(bus)
+
+	coord := coordinator.NewLifecycleCoordinator(
+		reg, bus, lc, sched, hm, rw, tc, cm, rm, sc, audLog,
+	)
+
+	mgr := &SandboxManager{
+		cfg:            cfg,
+		adapter:        adapter,
+		reg:            reg,
+		bus:            bus,
+		recorder:       rec,
+		lifecycle:      lc,
+		images:         images.NewImageManager(cfg, adapter, bus),
+		workspace:      workspace.NewWorkspaceManager(cfg),
+		filesystem:     filesystem.NewFilesystemManager(),
+		network:        network.NewNetworkManager(cfg, rec),
+		volumes:        volumes.NewVolumeManager(cfg, rec),
+		policyReg:      polReg,
+		policyVal:      polVal,
+		resolver:       resv,
+		resEngine:      resEng,
+		secEngine:      secEng,
+		monitor:        mon,
+		auditLogger:    audLog,
+		cleanupManager: cm,
+		scheduler:      sched,
+		health:         hm,
+		watcher:        rw,
+		timeout:        tc,
+		recovery:       rm,
+		stats:          sc,
+		coordinator:    coord,
+	}
+
+	cm.RegisterTeardown(func(ctx context.Context, id string) error {
+		return mgr.DestroySandbox(ctx, id)
+	})
 
 	mon.RegisterViolationHandler(func(ctx context.Context, id string, reason string) {
 		_ = mgr.Stop(ctx, id, 1*time.Second)
@@ -92,6 +142,7 @@ func NewSandboxManager(cfg config.Config, adapter runtime.RuntimeAdapter, rec me
 	})
 
 	mon.Start(context.Background())
+	coord.Start(context.Background())
 
 	return mgr
 }
@@ -421,6 +472,42 @@ func (sm *SandboxManager) GetPolicyRegistry() policies.Registry {
 
 func (sm *SandboxManager) GetAuditLogger() *audit.AuditLogger {
 	return sm.auditLogger
+}
+
+func (sm *SandboxManager) GetCleanupManager() *cleanup.CleanupManager {
+	return sm.cleanupManager
+}
+
+func (sm *SandboxManager) Lifecycle() *lifecycle.LifecycleManager {
+	return sm.lifecycle
+}
+
+func (sm *SandboxManager) GetScheduler() *scheduler.SandboxScheduler {
+	return sm.scheduler
+}
+
+func (sm *SandboxManager) GetHealthMonitor() *health.HealthMonitor {
+	return sm.health
+}
+
+func (sm *SandboxManager) GetResourceWatcher() *watcher.ResourceWatcher {
+	return sm.watcher
+}
+
+func (sm *SandboxManager) GetTimeoutController() *timeout.TimeoutController {
+	return sm.timeout
+}
+
+func (sm *SandboxManager) GetRecoveryManager() *recovery.RecoveryManager {
+	return sm.recovery
+}
+
+func (sm *SandboxManager) GetStatisticsCollector() *statistics.StatisticsCollector {
+	return sm.stats
+}
+
+func (sm *SandboxManager) GetLifecycleCoordinator() *coordinator.LifecycleCoordinator {
+	return sm.coordinator
 }
 
 // Helper to generate secure random IDs
