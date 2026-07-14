@@ -19,6 +19,18 @@ const (
 	SandboxDestroyed  Type = "sandbox_destroyed"
 	ImagePulled       Type = "image_pulled"
 	ImageValidated    Type = "image_validated"
+
+	// Stage 3 Module 2 Security/Resource events
+	PolicyResolved         Type = "policy_resolved"
+	PolicyValidated        Type = "policy_validated"
+	SecurityProfileApplied Type = "security_profile_applied"
+	ResourceProfileApplied Type = "resource_profile_applied"
+	LimitExceeded          Type = "limit_exceeded"
+	ExecutionDenied        Type = "execution_denied"
+	FilesystemPrepared     Type = "filesystem_prepared"
+	NetworkPrepared        Type = "network_prepared"
+	AuditRecorded          Type = "audit_recorded"
+	ResourceViolation      Type = "resource_violation"
 )
 
 // Event describes a structured sandbox lifecycle event.

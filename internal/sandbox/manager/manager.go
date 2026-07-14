@@ -17,6 +17,11 @@ import (
 	"cpip/internal/sandbox/network"
 	"cpip/internal/sandbox/registry"
 	"cpip/internal/sandbox/runtime"
+	"cpip/internal/sandbox/security/audit"
+	"cpip/internal/sandbox/security/engine"
+	"cpip/internal/sandbox/security/monitor"
+	"cpip/internal/sandbox/security/policies"
+	"cpip/internal/sandbox/security/resolver"
 	"cpip/internal/sandbox/types"
 	"cpip/internal/sandbox/volumes"
 	"cpip/internal/sandbox/workspace"
@@ -24,17 +29,24 @@ import (
 
 // SandboxManager orchestrates the lifecycle, workspaces, filesystem operations, and container runtimes.
 type SandboxManager struct {
-	cfg        config.Config
-	adapter    runtime.RuntimeAdapter
-	reg        *registry.SandboxRegistry
-	bus        *events.Bus
-	recorder   metrics.Recorder
-	lifecycle  *lifecycle.LifecycleManager
-	images     *images.ImageManager
-	workspace  *workspace.WorkspaceManager
-	filesystem *filesystem.FilesystemManager
-	network    *network.NetworkManager
-	volumes    *volumes.VolumeManager
+	cfg         config.Config
+	adapter     runtime.RuntimeAdapter
+	reg         *registry.SandboxRegistry
+	bus         *events.Bus
+	recorder    metrics.Recorder
+	lifecycle   *lifecycle.LifecycleManager
+	images      *images.ImageManager
+	workspace   *workspace.WorkspaceManager
+	filesystem  *filesystem.FilesystemManager
+	network     *network.NetworkManager
+	volumes     *volumes.VolumeManager
+	policyReg   policies.Registry
+	policyVal   policies.Validator
+	resolver    *resolver.PolicyResolver
+	resEngine   *engine.ResourcePolicyEngine
+	secEngine   *engine.SecurityPolicyEngine
+	monitor     *monitor.ResourceMonitor
+	auditLogger *audit.AuditLogger
 }
 
 // NewSandboxManager initializes a SandboxManager composition root.
@@ -45,43 +57,111 @@ func NewSandboxManager(cfg config.Config, adapter runtime.RuntimeAdapter, rec me
 	bus := events.NewBus()
 	reg := registry.NewSandboxRegistry()
 
-	return &SandboxManager{
-		cfg:        cfg,
-		adapter:    adapter,
-		reg:        reg,
-		bus:        bus,
-		recorder:   rec,
-		lifecycle:  lifecycle.NewLifecycleManager(bus, rec),
-		images:     images.NewImageManager(cfg, adapter, bus),
-		workspace:  workspace.NewWorkspaceManager(cfg),
-		filesystem: filesystem.NewFilesystemManager(),
-		network:    network.NewNetworkManager(cfg, rec),
-		volumes:    volumes.NewVolumeManager(cfg, rec),
+	polReg := policies.NewMemRegistry()
+	polVal := policies.NewPolicyValidator(policies.DefaultBounds)
+	resv := resolver.NewPolicyResolver(polReg, polVal)
+	resEng := engine.NewResourcePolicyEngine()
+	secEng := engine.NewSecurityPolicyEngine()
+	audLog := audit.NewAuditLogger(bus, nil)
+	mon := monitor.NewResourceMonitor(reg, adapter, bus, rec, 100*time.Millisecond)
+
+	mgr := &SandboxManager{
+		cfg:         cfg,
+		adapter:     adapter,
+		reg:         reg,
+		bus:         bus,
+		recorder:    rec,
+		lifecycle:   lifecycle.NewLifecycleManager(bus, rec),
+		images:      images.NewImageManager(cfg, adapter, bus),
+		workspace:   workspace.NewWorkspaceManager(cfg),
+		filesystem:  filesystem.NewFilesystemManager(),
+		network:     network.NewNetworkManager(cfg, rec),
+		volumes:     volumes.NewVolumeManager(cfg, rec),
+		policyReg:   polReg,
+		policyVal:   polVal,
+		resolver:    resv,
+		resEngine:   resEng,
+		secEngine:   secEng,
+		monitor:     mon,
+		auditLogger: audLog,
 	}
+
+	mon.RegisterViolationHandler(func(ctx context.Context, id string, reason string) {
+		_ = mgr.Stop(ctx, id, 1*time.Second)
+		audLog.Record("violation_detected", id, "", reason, nil)
+	})
+
+	mon.Start(context.Background())
+
+	return mgr
 }
 
 // CreateSandbox registers, prepares directory workspace, pulls image and creates the container.
-func (sm *SandboxManager) CreateSandbox(ctx context.Context, jobID, language string, expiration time.Duration) (*types.SandboxSession, error) {
-	// 1. Map language to image
+func (sm *SandboxManager) CreateSandbox(ctx context.Context, jobID, language string, expiration time.Duration, secProfile string, resProfile string, custom map[string]any) (*types.SandboxSession, error) {
+	// 1. Generate Sandbox ID early to associate with logs/audit
+	sbID := generateID()
+
+	// 2. Resolve policies and validate
+	resPolicy, err := sm.resolver.ResolveResourcePolicy(resProfile, custom)
+	if err != nil {
+		sm.auditLogger.Record("execution_denied", sbID, jobID, fmt.Sprintf("failed to resolve resource policy: %v", err), nil)
+		return nil, fmt.Errorf("resource policy resolve: %w", err)
+	}
+
+	secPolicy, err := sm.resolver.ResolveSecurityPolicy(secProfile, custom)
+	if err != nil {
+		sm.auditLogger.Record("execution_denied", sbID, jobID, fmt.Sprintf("failed to resolve security policy: %v", err), nil)
+		return nil, fmt.Errorf("security policy resolve: %w", err)
+	}
+
+	// Publish PolicyResolved and Profile Applied events
+	sm.bus.Publish(events.Event{
+		Type:      events.PolicyResolved,
+		SandboxID: sbID,
+		JobID:     jobID,
+		Timestamp: time.Now(),
+		Payload:   map[string]any{"security": secPolicy.ID, "resource": resPolicy.ID},
+	})
+
+	sm.bus.Publish(events.Event{
+		Type:      events.SecurityProfileApplied,
+		SandboxID: sbID,
+		JobID:     jobID,
+		Timestamp: time.Now(),
+		Payload:   secPolicy,
+	})
+
+	sm.bus.Publish(events.Event{
+		Type:      events.ResourceProfileApplied,
+		SandboxID: sbID,
+		JobID:     jobID,
+		Timestamp: time.Now(),
+		Payload:   resPolicy,
+	})
+
+	// Map to limits/settings
+	resLimits := sm.resEngine.CreateResourceLimits(resPolicy)
+	secSettings, sanitizedEnv := sm.secEngine.CreateSecuritySettings(secPolicy, nil)
+
+	// Map language to image
 	img, err := sm.images.GetImageForLanguage(language)
 	if err != nil {
 		return nil, err
 	}
 
-	// 2. Generate Sandbox ID
-	sbID := generateID()
-
 	// 3. Create initial session
 	now := time.Now()
 	sess := &types.SandboxSession{
-		ID:          sbID,
-		JobID:       jobID,
-		Language:    language,
-		Image:       img,
-		State:       types.StateCreated,
-		CreatedAt:   now,
-		ExpiresAt:   now.Add(expiration),
-		Metadata:    make(map[string]string),
+		ID:               sbID,
+		JobID:            jobID,
+		Language:         language,
+		Image:            img,
+		State:            types.StateCreated,
+		CreatedAt:        now,
+		ExpiresAt:        now.Add(expiration),
+		Metadata:         make(map[string]string),
+		MemoryLimitBytes: resLimits.MemoryBytes,
+		ProcessLimit:     resLimits.ProcessLimit,
 	}
 
 	sm.reg.Register(sess)
@@ -137,12 +217,28 @@ func (sm *SandboxManager) CreateSandbox(ctx context.Context, jobID, language str
 	// Create Container (infinitely running sleep block to allow workspace edits and execs)
 	containerName := fmt.Sprintf(sm.cfg.ContainerNamingPat, sbID)
 	cmd := []string{"sh", "-c", "while true; do sleep 3600; done"}
-	cID, err := sm.adapter.CreateContainer(ctx, img, cmd, nil, binds, netName, containerName)
+	cfg := runtime.ContainerConfig{
+		Image:     img,
+		Cmd:       cmd,
+		Env:       sanitizedEnv,
+		Binds:     binds,
+		Network:   netName,
+		Name:      containerName,
+		Resources: resLimits,
+		Security:  secSettings,
+	}
+
+	cID, err := sm.adapter.CreateContainer(ctx, cfg)
 	if err != nil {
 		_ = sm.DestroySandbox(ctx, sbID)
 		return nil, fmt.Errorf("container runtime create failed: %w", err)
 	}
 	sess.SetContainerID(cID)
+
+	sm.auditLogger.Record("policy_applied", sbID, jobID, "applied sandbox security and resource policy profiles", map[string]any{
+		"security_profile": secPolicy.ID,
+		"resource_profile": resPolicy.ID,
+	})
 
 	// Start container to make it ready
 	if err := sm.adapter.StartContainer(ctx, cID); err != nil {
@@ -317,6 +413,14 @@ func (sm *SandboxManager) Registry() *registry.SandboxRegistry {
 // EventBus returns the pub/sub events.Bus instance.
 func (sm *SandboxManager) EventBus() *events.Bus {
 	return sm.bus
+}
+
+func (sm *SandboxManager) GetPolicyRegistry() policies.Registry {
+	return sm.policyReg
+}
+
+func (sm *SandboxManager) GetAuditLogger() *audit.AuditLogger {
+	return sm.auditLogger
 }
 
 // Helper to generate secure random IDs

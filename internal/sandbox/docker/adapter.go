@@ -30,32 +30,59 @@ func NewDockerRuntimeAdapter() (*DockerRuntimeAdapter, error) {
 }
 
 // CreateContainer invokes Docker to create a container.
-func (a *DockerRuntimeAdapter) CreateContainer(ctx context.Context, img string, cmd []string, env []string, binds []string, network string, name string) (string, error) {
+func (a *DockerRuntimeAdapter) CreateContainer(ctx context.Context, cfg runtime.ContainerConfig) (string, error) {
 	config := &container.Config{
-		Image:        img,
-		Cmd:          cmd,
-		Env:          env,
+		Image:        cfg.Image,
+		Cmd:          cfg.Cmd,
+		Env:          cfg.Env,
 		AttachStdout: true,
 		AttachStderr: true,
 		Tty:          false,
 	}
 
-	hostConfig := &container.HostConfig{
-		Binds: binds,
+	if cfg.Security.RunAsNonRoot || cfg.Security.UID > 0 {
+		config.User = fmt.Sprintf("%d:%d", cfg.Security.UID, cfg.Security.GID)
 	}
 
-	resp, err := a.cli.ContainerCreate(ctx, config, hostConfig, nil, nil, name)
+	var pidsLimit *int64
+	if cfg.Resources.ProcessLimit > 0 {
+		val := cfg.Resources.ProcessLimit
+		pidsLimit = &val
+	}
+
+	hostConfig := &container.HostConfig{
+		Binds: cfg.Binds,
+		Resources: container.Resources{
+			CPUShares: cfg.Resources.CPUShares,
+			CPUQuota:  cfg.Resources.CPUQuotaUs,
+			Memory:    cfg.Resources.MemoryBytes,
+			PidsLimit: pidsLimit,
+		},
+		ReadonlyRootfs: cfg.Security.ReadOnlyRoot,
+		CapDrop:        cfg.Security.DropCapabilities,
+		CapAdd:         cfg.Security.AllowCapabilities,
+	}
+
+	if cfg.Resources.MemoryBytes > 0 && cfg.Resources.SwapBytes >= 0 {
+		hostConfig.Resources.MemorySwap = cfg.Resources.MemoryBytes + cfg.Resources.SwapBytes
+	}
+
+	if cfg.Security.NetworkMode != "" {
+		hostConfig.NetworkMode = container.NetworkMode(cfg.Security.NetworkMode)
+	}
+
+	resp, err := a.cli.ContainerCreate(ctx, config, hostConfig, nil, nil, cfg.Name)
 	if err != nil {
 		return "", fmt.Errorf("docker container creation failed: %w", err)
 	}
 
-	// If a custom network is configured and is not empty, attach it.
-	if network != "" && network != "bridge" && network != "default" {
-		err = a.cli.NetworkConnect(ctx, network, resp.ID, nil)
+	// If a custom network is configured and network mode is not none, attach it.
+	if cfg.Network != "" && cfg.Security.NetworkMode != "none" && cfg.Security.NetworkMode != "isolated" {
+		err = a.cli.NetworkConnect(ctx, cfg.Network, resp.ID, nil)
 		if err != nil {
 			// Clean up container on network attach failure
 			_ = a.RemoveContainer(ctx, resp.ID)
-			return "", fmt.Errorf("failed to connect container to network %s: %w", network, err)
+			return "", fmt.Errorf("failed to connect container to network %s: %w", cfg.Network, err)
 		}
 	}
 

@@ -37,7 +37,7 @@ func NewMockRuntimeAdapter() *MockRuntimeAdapter {
 	}
 }
 
-func (m *MockRuntimeAdapter) CreateContainer(ctx context.Context, image string, cmd []string, env []string, binds []string, network string, name string) (string, error) {
+func (m *MockRuntimeAdapter) CreateContainer(ctx context.Context, cfg runtime.ContainerConfig) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -45,7 +45,7 @@ func (m *MockRuntimeAdapter) CreateContainer(ctx context.Context, image string, 
 		return "", errors.New("container creation forced failure")
 	}
 
-	cID := "container-" + name
+	cID := "container-" + cfg.Name
 	m.Containers[cID] = runtime.ContainerInfo{
 		ID:      cID,
 		State:   "created",
@@ -169,7 +169,7 @@ func TestSandboxLifecycle(t *testing.T) {
 
 	// 2. Create Sandbox
 	ctx := context.Background()
-	sess, err := mgr.CreateSandbox(ctx, "job-1", "python3", 10*time.Second)
+	sess, err := mgr.CreateSandbox(ctx, "job-1", "python3", 10*time.Second, "", "", nil)
 	if err != nil {
 		t.Fatalf("CreateSandbox failed: %v", err)
 	}
@@ -301,7 +301,7 @@ func TestCleanupSweep(t *testing.T) {
 	defer cleanupMgr.Stop()
 
 	// Create a sandbox with immediate expiration (1 millisecond)
-	sess, err := mgr.CreateSandbox(ctx, "job-expired", "python3", 1*time.Millisecond)
+	sess, err := mgr.CreateSandbox(ctx, "job-expired", "python3", 1*time.Millisecond, "", "", nil)
 	if err != nil {
 		t.Fatalf("Failed to create sandbox: %v", err)
 	}
@@ -330,7 +330,7 @@ func TestConcurrentSandboxes(t *testing.T) {
 			defer wg.Done()
 			ctx := context.Background()
 
-			sess, err := mgr.CreateSandbox(ctx, "job-concurrent", "python3", 10*time.Second)
+			sess, err := mgr.CreateSandbox(ctx, "job-concurrent", "python3", 10*time.Second, "", "", nil)
 			if err != nil {
 				t.Errorf("CreateSandbox failed in worker %d: %v", id, err)
 				return

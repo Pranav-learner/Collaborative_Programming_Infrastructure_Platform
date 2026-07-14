@@ -35,10 +35,12 @@ type SandboxSession struct {
 	Mounts         []string          `json:"mounts"`
 	Volumes        []string          `json:"volumes"`
 	Network        string            `json:"network"`
-	CreatedAt      time.Time         `json:"created_at"`
-	ExpiresAt      time.Time         `json:"expires_at"`
-	Metadata       map[string]string `json:"metadata,omitempty"`
-	Stats          Stats             `json:"stats"`
+	CreatedAt        time.Time         `json:"created_at"`
+	ExpiresAt        time.Time         `json:"expires_at"`
+	Metadata         map[string]string `json:"metadata,omitempty"`
+	Stats            Stats             `json:"stats"`
+	MemoryLimitBytes int64             `json:"memory_limit_bytes"`
+	ProcessLimit     int64             `json:"process_limit"`
 }
 
 func (s *SandboxSession) GetState() State {
@@ -134,6 +136,30 @@ func (s *SandboxSession) SetStats(st Stats) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.Stats = st
+}
+
+func (s *SandboxSession) GetMemoryLimitBytes() int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.MemoryLimitBytes
+}
+
+func (s *SandboxSession) SetMemoryLimitBytes(l int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.MemoryLimitBytes = l
+}
+
+func (s *SandboxSession) GetProcessLimit() int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.ProcessLimit
+}
+
+func (s *SandboxSession) SetProcessLimit(l int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ProcessLimit = l
 }
 
 func (s *SandboxSession) Lock() {

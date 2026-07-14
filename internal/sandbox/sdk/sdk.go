@@ -12,7 +12,7 @@ import (
 // The execution engine must interact with sandboxes ONLY through this interface.
 type SandboxSDK interface {
 	// CreateSandbox registers, prepares directory workspace, pulls image and creates the container.
-	CreateSandbox(ctx context.Context, jobID, language string, expiration time.Duration) (*types.SandboxSession, error)
+	CreateSandbox(ctx context.Context, jobID, language string, expiration time.Duration, secProfile string, resProfile string, custom map[string]any) (*types.SandboxSession, error)
 
 	// DestroySandbox stops the container, cleans up mounts/volumes, deletes the workspace and removes the container.
 	DestroySandbox(ctx context.Context, sandboxID string) error
